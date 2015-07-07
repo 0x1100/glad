@@ -3,4 +3,10 @@
 *.kdev4
 build/
 *.o
+a.out
 *.kdev_include_paths
+main.c
+*.diff
+.idea
+dist/
+*.egg-info

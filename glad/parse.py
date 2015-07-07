@@ -1,17 +1,44 @@
 try:
-    import xml.etree.cElementTree as etree
-except ImportError:
-    import xml.etree.ElementTree as etree
+    from lxml import etree
+    from lxml.etree import ETCompatXMLParser as parser
 
-from contextlib import closing
-from urllib2 import urlopen
-from itertools import chain
+    def xml_fromstring(argument):
+        return etree.fromstring(argument, parser=parser())
+
+    def xml_frompath(path):
+        return etree.parse(path, parser=parser()).getroot()
+except ImportError:
+    try:
+        import xml.etree.cElementTree as etree
+    except ImportError:
+        import xml.etree.ElementTree as etree
+
+    def xml_fromstring(argument):
+        return etree.fromstring(argument)
+
+    def xml_frompath(path):
+        return etree.parse(path).getroot()
+
+
 from collections import defaultdict, OrderedDict
+from contextlib import closing
+from itertools import chain
+import sys
+import re
+
+
+if sys.version_info >= (3, 0):
+    from urllib.request import urlopen
+else:
+    from urllib2 import urlopen
+
+
+_ARRAY_RE = re.compile(r'\[\d+\]')
 
 
 class Spec(object):
     API = 'https://cvs.khronos.org/svn/repos/ogl/trunk/doc/registry/public/api/'
-    NAME = None
+    NAME = ''
 
     def __init__(self, root):
         self.root = root
@@ -25,11 +52,10 @@ class Spec(object):
 
     @classmethod
     def from_url(cls, url):
-        raw = ''
         with closing(urlopen(url)) as f:
             raw = f.read()
 
-        return cls(etree.fromstring(raw))
+        return cls(xml_fromstring(raw))
 
     @classmethod
     def from_svn(cls):
@@ -37,11 +63,11 @@ class Spec(object):
 
     @classmethod
     def fromstring(cls, string):
-        return cls(etree.fromstring(raw))
+        return cls(xml_fromstring(string))
 
     @classmethod
     def from_file(cls, path):
-        return cls(etree.parse(path).getroot())
+        return cls(xml_frompath(path))
 
     @property
     def comment(self):
@@ -71,13 +97,13 @@ class Spec(object):
 
     @property
     def enums(self):
-        if not self._enums is None:
+        if self._enums is not None:
             return self._enums
 
         self._enums = dict()
         for element in self.root.iter('enums'):
             namespace = element.attrib['namespace']
-            type = element.get('type')
+            type_ = element.get('type')
             group = element.get('group')
             vendor = element.get('vendor')
             comment = element.get('comment', '')
@@ -89,13 +115,13 @@ class Spec(object):
 
                 name = enum.attrib['name']
                 self._enums[name] = Enum(name, enum.attrib['value'], namespace,
-                                         type, group, vendor, comment)
+                                         type_, group, vendor, comment)
 
         return self._enums
 
     @property
     def features(self):
-        if not self._features is None:
+        if self._features is not None:
             return self._features
 
         self._features = defaultdict(OrderedDict)
@@ -107,7 +133,7 @@ class Spec(object):
 
     @property
     def extensions(self):
-        if not self._extensions is None:
+        if self._extensions is not None:
             return self._extensions
 
         self._extensions = defaultdict(dict)
@@ -121,7 +147,8 @@ class Spec(object):
 class Type(object):
     def __init__(self, element):
         apientry = element.find('apientry')
-        if apientry != None: apientry.text = 'APIENTRY'
+        if apientry is not None:
+            apientry.text = 'APIENTRY'
         self.raw = ''.join(element.itertext())
         self.api = element.get('api')
         self.name = element.get('name')
@@ -130,6 +157,7 @@ class Type(object):
     def is_preprocessor(self):
         return '#' in self.raw
 
+
 class Group(object):
     def __init__(self, element):
         self.name = element.attrib['name']
@@ -137,12 +165,12 @@ class Group(object):
 
 
 class Enum(object):
-    def __init__(self, name, value, namespace, type = None,
-                 group = None, vendor = None, comment = ''):
+    def __init__(self, name, value, namespace, type_=None,
+                 group=None, vendor=None, comment=''):
         self.name = name
         self.value = value
         self.namespace = namespace
-        self.type = type
+        self.type = type_
         self.group = group
         self.vendor = vendor
         self.comment = comment
@@ -152,6 +180,7 @@ class Enum(object):
 
     def __str__(self):
         return self.name
+
     __repr__ = __str__
 
 
@@ -165,6 +194,7 @@ class Command(object):
 
     def __str__(self):
         return '{self.proto.name}'.format(self=self)
+
     __repr__ = __str__
 
 
@@ -183,7 +213,6 @@ class Param(object):
         self.type = OGLType(element)
         self.name = element.find('name').text
 
-
     def __str__(self):
         return '{0!r} {1}'.format(self.type, self.name)
 
@@ -193,31 +222,34 @@ class OGLType(object):
         text = ''.join(element.itertext())
         self.type = (text.replace('const', '').replace('unsigned', '')
                      .replace('struct', '').strip().split(None, 1)[0]
-                if element.find('ptype') is None else element.find('ptype').text)
+                     if element.find('ptype') is None else element.find('ptype').text)
+        # 0 if no pointer, 1 if *, 2 if **
         self.is_pointer = 0 if text is None else text.count('*')
+        # it can be a pointer to an array, or just an array
+        self.is_pointer += len(_ARRAY_RE.findall(text))
         self.is_const = False if text is None else 'const' in text
         self.is_unsigned = False if text is None else 'unsigned' in text
 
-        if 'struct' in text and not 'struct' in self.type:
+        if 'struct' in text and 'struct' not in self.type:
             self.type = 'struct {}'.format(self.type)
 
     def to_d(self):
-
         if self.is_pointer > 1 and self.is_const:
             s = 'const({}{}*)'.format('u' if self.is_unsigned else '', self.type)
-            s += '*'*(self.is_pointer-1)
+            s += '*' * (self.is_pointer - 1)
         else:
             t = '{}{}'.format('u' if self.is_unsigned else '', self.type)
             s = 'const({})'.format(t) if self.is_const else t
-            s += '*'*self.is_pointer
+            s += '*' * self.is_pointer
         return s.replace('struct ', '')
+
     to_volt = to_d
 
     def to_c(self):
         ut = 'unsigned {}'.format(self.type) if self.is_unsigned else self.type
         s = '{}const {}'.format('unsigned ' if self.is_unsigned else '', self.type) \
-                if self.is_const else ut
-        s += '*'*self.is_pointer
+            if self.is_const else ut
+        s += '*' * self.is_pointer
         return s
 
     __str__ = to_d
@@ -230,13 +262,14 @@ class Extension(object):
 
         self.require = []
         for required in chain.from_iterable(element.findall('require')):
-            if required.tag == 'type': continue
+            if required.tag == 'type':
+                continue
 
-            data = { 'enum' : spec.enums, 'command' : spec.commands }[required.tag]
+            data = {'enum': spec.enums, 'command': spec.commands}[required.tag]
             try:
                 self.require.append(data[required.attrib['name']])
             except KeyError:
-                pass # TODO
+                pass  # TODO
 
     @property
     def enums(self):
@@ -255,6 +288,7 @@ class Extension(object):
 
     def __str__(self):
         return self.name
+
     __repr__ = __str__
 
 
@@ -266,13 +300,14 @@ class Feature(Extension):
         # not every spec has a ._remove member, but there shouldn't be a remove
         # tag without that member, if there is, blame me!
         for removed in chain.from_iterable(element.findall('remove')):
-            if removed.tag == 'type': continue
+            if removed.tag == 'type':
+                continue
 
-            data = {'enum' : spec.enums, 'command' : spec.commands}[removed.tag]
+            data = {'enum': spec.enums, 'command': spec.commands}[removed.tag]
             try:
                 spec._remove.add(data[removed.attrib['name']])
             except KeyError:
-                pass # TODO
+                pass  # TODO
 
         self.number = tuple(map(int, element.attrib['number'].split('.')))
         self.api = element.attrib['api']
@@ -283,12 +318,13 @@ class Feature(Extension):
     @property
     def enums(self):
         for enum in super(Feature, self).enums:
-            if not enum in getattr(self.spec, 'removed', []):
+            if enum not in getattr(self.spec, 'removed', []):
                 yield enum
+
     @property
     def functions(self):
         for func in super(Feature, self).functions:
-            if not func in getattr(self.spec, 'removed', []):
+            if func not in getattr(self.spec, 'removed', []):
                 yield func
 
     __repr__ = __str__
